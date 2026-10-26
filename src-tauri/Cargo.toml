@@ -1,0 +1,28 @@
+[package]
+name = "desk_pos"
+version = "0.1.0-alpha.0"
+edition = "2024"
+
+[lib]
+name = "desktop_lib"
+crate-type = [
+    "staticlib",
+    "cdylib",
+    "rlib",
+]
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [
+] }
+
+[dependencies]
+tauri = { version = "2.12.5", features = [
+] }
+serde = { version = "1.0.229", features = [
+    "derive",
+] }
+serde_json = "1.0.154"
+dotenvy = "0.15.7"
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,502 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Run Rust validation on branch pushes, pull requests, manual runs, and tags.
+  compile:
+    name: Compile & test
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> src-tauri/target
+          shared-key: tauri-ci
+
+      - name: Check Rust
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Test Rust
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Rust application
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml
+
+  # Shared frontend install logic is repeated on native runners so Tauri's
+  # beforeBuildCommand can run normally when the project uses a JS frontend.
+  build-linux:
+    name: Linux x86_64
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: compile
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f pnpm-lock.yaml ]]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            corepack enable
+            if [[ -f .yarnrc.yml ]]; then
+              yarn install --immutable
+            else
+              yarn install --frozen-lockfile
+            fi
+          elif [[ -f bun.lock || -f bun.lockb ]]; then
+            npm install --global bun
+            bun install --frozen-lockfile
+          elif [[ -f package.json ]]; then
+            npm install
+          else
+            echo 'No root package.json found; skipping frontend dependency installation.'
+          fi
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libfuse2 \
+            patchelf \
+            pkg-config \
+            wget \
+            xdg-utils
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> src-tauri/target
+          shared-key: release-linux
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Build Linux installers
+        run: cargo tauri build --ci --target x86_64-unknown-linux-gnu --bundles deb,appimage
+
+      - name: Package Linux installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bundle="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
+          mkdir -p dist-release
+          shopt -s nullglob
+          deb_files=("$bundle"/deb/*.deb)
+          appimage_files=("$bundle"/appimage/*.AppImage)
+
+          if [[ ${#deb_files[@]} -eq 0 ]]; then
+            echo 'No Linux .deb installer found.' >&2
+            exit 1
+          fi
+          if [[ ${#appimage_files[@]} -eq 0 ]]; then
+            echo 'No Linux AppImage found.' >&2
+            exit 1
+          fi
+
+          cp "${deb_files[0]}" "dist-release/back_pos-${version}-linux-x86_64.deb"
+          cp "${appimage_files[0]}" "dist-release/back_pos-${version}-linux-x86_64.AppImage"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Windows x86_64
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: compile
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f pnpm-lock.yaml ]]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            corepack enable
+            if [[ -f .yarnrc.yml ]]; then
+              yarn install --immutable
+            else
+              yarn install --frozen-lockfile
+            fi
+          elif [[ -f bun.lock || -f bun.lockb ]]; then
+            npm install --global bun
+            bun install --frozen-lockfile
+          elif [[ -f package.json ]]; then
+            npm install
+          else
+            echo 'No root package.json found; skipping frontend dependency installation.'
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> src-tauri/target
+          shared-key: release-windows
+
+      - name: Ensure WiX Toolset v3 is available for MSI packaging
+        shell: pwsh
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue) -or
+              -not (Get-Command light.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version=3.14.1 --yes --no-progress
+            $wixBin = Join-Path ${env:ProgramFiles(x86)} 'WiX Toolset v3.14\bin'
+            if (Test-Path $wixBin) {
+              $env:PATH = "$wixBin;$env:PATH"
+              Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+            }
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue) -or
+              -not (Get-Command light.exe -ErrorAction SilentlyContinue)) {
+            throw 'WiX Toolset v3 (candle.exe/light.exe) is required to generate the MSI installer.'
+          }
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Build Windows installers
+        run: cargo tauri build --ci --target x86_64-pc-windows-msvc --bundles nsis,msi
+
+      - name: Package Windows installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $bundle = 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle'
+          $nsisDir = Join-Path $bundle 'nsis'
+          $msiDir = Join-Path $bundle 'msi'
+          $exe = Get-ChildItem -LiteralPath $nsisDir -Filter '*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          $msi = Get-ChildItem -LiteralPath $msiDir -Filter '*.msi' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (-not $exe) { throw "No NSIS .exe installer found in $nsisDir" }
+          if (-not $msi) { throw "No MSI installer found in $msiDir. Check WiX Toolset v3 and the Tauri build log." }
+
+          New-Item -ItemType Directory -Force -Path 'dist-release' | Out-Null
+          Copy-Item -LiteralPath $exe.FullName -Destination "dist-release/back_pos-$version-windows-x86_64.exe"
+          Copy-Item -LiteralPath $msi.FullName -Destination "dist-release/back_pos-$version-windows-x86_64.msi"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos-arm64:
+    name: macOS Apple Silicon (ARM64)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: compile
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f pnpm-lock.yaml ]]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            corepack enable
+            if [[ -f .yarnrc.yml ]]; then
+              yarn install --immutable
+            else
+              yarn install --frozen-lockfile
+            fi
+          elif [[ -f bun.lock || -f bun.lockb ]]; then
+            npm install --global bun
+            bun install --frozen-lockfile
+          elif [[ -f package.json ]]; then
+            npm install
+          else
+            echo 'No root package.json found; skipping frontend dependency installation.'
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> src-tauri/target
+          shared-key: release-macos-arm64
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Build macOS Apple Silicon installer
+        run: cargo tauri build --ci --target aarch64-apple-darwin --bundles dmg
+
+      - name: Package macOS Apple Silicon installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bundle='src-tauri/target/aarch64-apple-darwin/release/bundle/dmg'
+          mkdir -p dist-release
+          shopt -s nullglob
+          files=("$bundle"/*.dmg)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo 'No Apple Silicon DMG found.' >&2
+            exit 1
+          fi
+          cp "${files[0]}" "dist-release/back_pos-${version}-macos-aarch64.dmg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos-intel:
+    name: macOS Intel (x86_64)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: compile
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f pnpm-lock.yaml ]]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            corepack enable
+            if [[ -f .yarnrc.yml ]]; then
+              yarn install --immutable
+            else
+              yarn install --frozen-lockfile
+            fi
+          elif [[ -f bun.lock || -f bun.lockb ]]; then
+            npm install --global bun
+            bun install --frozen-lockfile
+          elif [[ -f package.json ]]; then
+            npm install
+          else
+            echo 'No root package.json found; skipping frontend dependency installation.'
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> src-tauri/target
+          shared-key: release-macos-intel
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Build macOS Intel installer
+        run: cargo tauri build --ci --target x86_64-apple-darwin --bundles dmg
+
+      - name: Package macOS Intel installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bundle='src-tauri/target/x86_64-apple-darwin/release/bundle/dmg'
+          mkdir -p dist-release
+          shopt -s nullglob
+          files=("$bundle"/*.dmg)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo 'No Intel DMG found.' >&2
+            exit 1
+          fi
+          cp "${files[0]}" "dist-release/back_pos-${version}-macos-x86_64.dmg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-intel
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - compile
+      - build-linux
+      - build-windows
+      - build-macos-arm64
+      - build-macos-intel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(*)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo 'No release artifacts were downloaded.' >&2
+            exit 1
+          fi
+          sha256sum -- "${files[@]}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          short_sha="${COMMIT_SHA:0:12}"
+          built_at="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          download_base="${SERVER_URL}/${REPOSITORY}/releases/download/${TAG}"
+          changelog_url="${SERVER_URL}/${REPOSITORY}/commits/${TAG}"
+
+          cat > release-notes.md <<EOF
+          ## Release metadata
+
+          | Field | Value |
+          | --- | --- |
+          | Tag | \`${TAG}\` |
+          | Version | \`${version}\` |
+          | Commit | [\`${short_sha}\`](${SERVER_URL}/${REPOSITORY}/commit/${COMMIT_SHA}) |
+          | Built | ${built_at} |
+
+          ## Downloads
+
+          | Platform | File |
+          | --- | --- |
+          | Linux x86_64 (Debian package) | [back_pos-${version}-linux-x86_64.deb](${download_base}/back_pos-${version}-linux-x86_64.deb) |
+          | Linux x86_64 (AppImage) | [back_pos-${version}-linux-x86_64.AppImage](${download_base}/back_pos-${version}-linux-x86_64.AppImage) |
+          | Windows x86_64 (NSIS installer) | [back_pos-${version}-windows-x86_64.exe](${download_base}/back_pos-${version}-windows-x86_64.exe) |
+          | Windows x86_64 (MSI installer) | [back_pos-${version}-windows-x86_64.msi](${download_base}/back_pos-${version}-windows-x86_64.msi) |
+          | macOS Apple Silicon (ARM64) | [back_pos-${version}-macos-aarch64.dmg](${download_base}/back_pos-${version}-macos-aarch64.dmg) |
+          | macOS Intel (x86_64) | [back_pos-${version}-macos-x86_64.dmg](${download_base}/back_pos-${version}-macos-x86_64.dmg) |
+          | Checksums (SHA-256) | [SHA256SUMS.txt](${download_base}/SHA256SUMS.txt) |
+
+          Verify downloaded files with `SHA256SUMS.txt`.
+
+          Full Changelog: ${changelog_url}
+
+          **macOS note:** DMG files are unsigned unless Apple code signing and notarization are configured.
+          EOF
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: BackPOS ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
