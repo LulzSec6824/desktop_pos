@@ -1,0 +1,7 @@
+.idea
+.vs
+.trae
+.vscode
+
+node_modules/
+.env

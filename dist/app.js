@@ -203,6 +203,8 @@ var state = {
   posDiscount: 0, // sale-level absolute discount
   notifTimer: null,
   posProducts: {}, // id -> product map for the current POS tile set
+  posCustomerId: null, // customer attached to the current sale (uuid)
+  posCustomerName: null, // display name of the attached customer
 };
 
 function loadAuth() {
@@ -582,13 +584,13 @@ var NAV = [
     key: "pos",
     label: "Point of Sale",
     icon: "🛒",
-    roles: ["ADMIN", "MANAGER", "CASHIER"],
+    roles: ["ADMIN", "MANAGER", "INVENTORY_MANAGER", "CASHIER"],
   },
   {
     key: "transactions",
     label: "Transactions",
     icon: "🧾",
-    roles: ["ADMIN", "MANAGER", "CASHIER"],
+    roles: ["ADMIN", "MANAGER", "INVENTORY_MANAGER", "CASHIER"],
   },
   {
     key: "products",
@@ -625,7 +627,7 @@ var NAV = [
     key: "customers",
     label: "Customers",
     icon: "👥",
-    roles: ["ADMIN", "MANAGER", "CASHIER"],
+    roles: ["ADMIN", "MANAGER", "INVENTORY_MANAGER", "CASHIER"],
   },
   {
     key: "reports",
@@ -976,6 +978,8 @@ function logout(msg) {
   stopNotifPolling();
   state.cart = [];
   state.posDiscount = 0;
+  state.posCustomerId = null;
+  state.posCustomerName = null;
   state.meta = null;
   state.stores = [];
   state.storeId = null;
@@ -1362,10 +1366,6 @@ function renderPos(content) {
     step: "0.01",
     placeholder: "Cash tendered",
   });
-  var noteInput = h("input", {
-    class: "input",
-    placeholder: "Note (optional)",
-  });
   var tenderQuick = h("div", { class: "tender-quick" });
   var checkoutBtn = h(
     "button",
@@ -1402,11 +1402,20 @@ function renderPos(content) {
   });
 
   var clearBtn = h("button", { class: "btn ghost small" }, "Clear");
+  var customerBtn = h(
+    "button",
+    { class: "btn ghost small" },
+    "👤 Attach customer",
+  );
+  var customerChip = h("span", { class: "customer-chip", hidden: true });
   clearBtn.addEventListener("click", function () {
     if (!state.cart.length) return;
     state.cart = [];
     state.posDiscount = 0;
     renderCartLines();
+  });
+  customerBtn.addEventListener("click", function () {
+    openCustomerPicker();
   });
   checkoutBtn.addEventListener("click", function () {
     checkout();
@@ -1416,37 +1425,157 @@ function renderPos(content) {
     h(
       "div",
       { class: "panel cart-panel" },
-      h("div", { class: "panel-head" }, h("h3", {}, "Cart"), clearBtn),
+      h(
+        "div",
+        { class: "panel-head" },
+        h("h3", {}, "Cart"),
+        h("div", { class: "cart-head-actions" }, customerBtn, clearBtn),
+      ),
+      h("div", { class: "cart-customer" }, customerChip),
       cartLines,
       totalsBox,
       h("div", { class: "pay-row" }, methodSel, tenderedInput),
       tenderQuick,
-      h("div", { class: "pay-note" }, noteInput),
       checkoutBtn,
     ),
   );
 
+  function syncCustomerChip() {
+    if (state.posCustomerId) {
+      customerChip.hidden = false;
+      customerChip.innerHTML = "";
+      customerChip.appendChild(
+        h(
+          "span",
+          { class: "cl-name" },
+          "👤 " + (state.posCustomerName || "Customer"),
+        ),
+      );
+      var clear = h(
+        "button",
+        {
+          type: "button",
+          class: "cl-remove",
+          title: "Detach customer",
+          onClick: function () {
+            state.posCustomerId = null;
+            state.posCustomerName = null;
+            syncCustomerChip();
+          },
+        },
+        "✕",
+      );
+      customerChip.appendChild(clear);
+    } else {
+      customerChip.hidden = true;
+      customerChip.innerHTML = "";
+    }
+  }
+
+  /* Customer search + attach (drives the customer_id field of the sale). */
+  function openCustomerPicker() {
+    var m = openModal({
+      title: "Attach customer",
+      footer: true,
+    });
+    var search = h("input", {
+      class: "input",
+      placeholder: "Search name / phone / email…",
+    });
+    var list = h("div", { class: "notif-list" });
+    m.body.appendChild(
+      h(
+        "div",
+        { class: "field" },
+        h("label", { class: "label" }, "Search"),
+        search,
+      ),
+    );
+    m.body.appendChild(list);
+    m.foot.appendChild(
+      h("button", { class: "btn ghost", onClick: m.close }, "Close"),
+    );
+
+    function renderList(items) {
+      list.innerHTML = "";
+      if (!items.length) {
+        list.appendChild(h("div", { class: "empty" }, "No customers found."));
+        return;
+      }
+      items.forEach(function (c) {
+        var row = h(
+          "button",
+          { type: "button", class: "picker-item block" },
+          h("span", { class: "picker-name" }, c.name),
+          h(
+            "span",
+            { class: "picker-meta" },
+            (c.phone || "—") + " · " + num(c.loyalty_points) + " pts",
+          ),
+        );
+        row.addEventListener("click", function () {
+          state.posCustomerId = c.id;
+          state.posCustomerName = c.name;
+          syncCustomerChip();
+          m.close();
+        });
+        list.appendChild(row);
+      });
+    }
+    var run = debounce(async function () {
+      try {
+        var data = await apiFetch(
+          "/customers" +
+            qs({ search: search.value.trim() || undefined, per_page: 100 }),
+        );
+        renderList(itemsOf(data));
+      } catch (err) {
+        list.innerHTML = "";
+        list.appendChild(errorBox(err));
+      }
+    }, 220);
+    search.addEventListener("input", run);
+    run();
+  }
+
   /* Discount input lives inside the totals block (re-rendered with totals). */
+  /* Totals mirror the backend pricing exactly:
+     line_base = round2(price × qty) → per-line discount (clamped to the line)
+     → line tax = round2(net × rate / 100) per line
+     → grand = round2(subtotal − Σdiscount + Σtax). */
   function posTotals() {
     var lines = state.cart.map(function (l) {
-      return { l: l, gross: round2(l.unit_price * l.quantity) };
+      return { l: l, base: round2(l.unit_price * l.quantity), disc: 0 };
     });
     var subtotal = round2(
       lines.reduce(function (s, x) {
-        return s + x.gross;
+        return s + x.base;
       }, 0),
     );
-    var discount = Math.min(Math.max(0, round2(state.posDiscount)), subtotal);
+    var saleDiscount = Math.min(
+      Math.max(0, round2(state.posDiscount)),
+      subtotal,
+    );
+    if (saleDiscount > 0 && subtotal > 0) {
+      /* spread the sale-level discount across lines, proportional to value */
+      var allocated = 0;
+      lines.forEach(function (x, i) {
+        if (i === lines.length - 1) {
+          x.disc = Math.min(x.base, round2(saleDiscount - allocated));
+        } else {
+          x.disc = Math.min(x.base, round2((saleDiscount * x.base) / subtotal));
+          allocated = round2(allocated + x.disc);
+        }
+      });
+    }
     var tax = 0;
+    var discount = 0;
     lines.forEach(function (x) {
-      x.disc =
-        subtotal > 0 && discount > 0
-          ? Math.min(x.gross, round2((discount * x.gross) / subtotal))
-          : 0;
-      x.net = round2(x.gross - x.disc);
-      tax += (x.net * num(x.l.tax_rate)) / 100;
+      var net = round2(x.base - x.disc);
+      x.tax = round2((net * num(x.l.tax_rate)) / 100);
+      tax = round2(tax + x.tax);
+      discount = round2(discount + x.disc);
     });
-    tax = round2(tax);
     return {
       lines: lines,
       subtotal: subtotal,
@@ -1561,23 +1690,20 @@ function renderPos(content) {
     if (!state.cart.length) return;
     var t = posTotals();
     var method = methodSel.value;
-    var tendered = method === "CASH" ? num(tenderedInput.value) : 0;
+    var tendered = method === "CASH" ? round2(num(tenderedInput.value)) : 0;
     var payloadItems = t.lines.map(function (x) {
       var it = { product_id: x.l.product_id, quantity: x.l.quantity };
       if (x.disc > 0)
         it.line_discount = x.disc; /* proportional share of the sale discount */
       return it;
     });
-    var payments = [
-      {
-        method: method,
-        amount:
-          method === "CASH" && tendered > t.grand ? round2(tendered) : t.grand,
-      },
-    ];
-    var body = { items: payloadItems, payments: payments };
-    var noteVal = noteInput.value.trim();
-    if (noteVal) body.note = noteVal;
+    /* One payment of the exact server-computed grand total: sending
+       `payment_method` (instead of an explicit payments array) makes the
+       backend record a payment equal to its own grand_total, so a cent of
+       rounding difference or over-tendered cash can never 400 the sale. */
+    var body = { items: payloadItems, payment_method: method };
+    if (state.storeId) body.store_id = String(state.storeId);
+    if (state.posCustomerId) body.customer_id = state.posCustomerId;
 
     checkoutBtn.disabled = true;
     checkoutBtn.textContent = "Processing…";
@@ -1586,14 +1712,26 @@ function renderPos(content) {
         method: "POST",
         body: body,
       });
+      var change =
+        method === "CASH" && tendered > num(sale.grand_total)
+          ? round2(tendered - num(sale.grand_total))
+          : 0;
       state.cart = [];
       state.posDiscount = 0;
-      noteInput.value = "";
+      state.posCustomerId = null;
+      state.posCustomerName = null;
+      syncCustomerChip();
       tenderedInput.value = "";
       renderCartLines();
       loadPosTiles(searchInput.value.trim());
-      toast("success", "Sale " + (sale.receipt_number || "") + " completed.");
-      openReceiptModal(sale);
+      toast(
+        "success",
+        "Sale " +
+          (sale.receipt_number || "") +
+          " completed." +
+          (change > 0 ? " Change due: " + fmtMoney(change) : ""),
+      );
+      openReceiptModal(sale, change);
     } catch (err) {
       toastError(err);
     } finally {
@@ -1727,7 +1865,7 @@ function renderPos(content) {
             search: searchVal || undefined,
             store_id: state.storeId || undefined,
             active: "true",
-            per_page: 120,
+            per_page: 100,
           }),
       );
       var items = itemsOf(data);
@@ -1783,12 +1921,23 @@ function renderPos(content) {
 }
 
 /* Receipt modal — authoritative totals come from the POST /transactions response */
-function openReceiptModal(t) {
+function openReceiptModal(t, changeDue) {
   var m = openModal({
     title: "Receipt " + (t.receipt_number || t.id || ""),
     footer: true,
   });
-  m.body.appendChild(h("div", { class: "receipt-scroll" }, receiptNode(t)));
+  var body = receiptNode(t);
+  if (changeDue > 0) {
+    var line = h(
+      "div",
+      { class: "r-row" },
+      h("span", {}, "Change due"),
+      h("span", { class: "r-amt" }, fmtMoney(changeDue)),
+    );
+    var sep = body.querySelector(".r-thanks");
+    body.insertBefore(line, sep);
+  }
+  m.body.appendChild(h("div", { class: "receipt-scroll" }, body));
   m.foot.appendChild(
     h("button", { class: "btn ghost", onClick: m.close }, "Close"),
   );
@@ -1957,6 +2106,10 @@ function renderTransactions(content) {
       ),
     );
   });
+  var search = h("input", {
+    class: "input",
+    placeholder: "Receipt #…",
+  });
   var loadBtn = h("button", { class: "btn primary" }, "Load");
   var tableBox = h("div", {});
 
@@ -1985,6 +2138,12 @@ function renderTransactions(content) {
       ),
       h(
         "div",
+        { class: "field grow" },
+        h("label", { class: "label" }, "Receipt #"),
+        search,
+      ),
+      h(
+        "div",
         { class: "field" },
         h("label", { class: "label" }, "‎"),
         loadBtn,
@@ -1998,6 +2157,7 @@ function renderTransactions(content) {
   to.addEventListener("change", load);
   storeSel.addEventListener("change", load);
   statusSel.addEventListener("change", load);
+  search.addEventListener("input", debounce(load, 300));
 
   load();
 
@@ -2011,7 +2171,8 @@ function renderTransactions(content) {
             to: to.value || undefined,
             store_id: storeSel.value || undefined,
             status: statusSel.value || undefined,
-            per_page: 50,
+            search: search.value.trim() || undefined,
+            per_page: 100,
           }),
       );
       var items = itemsOf(data);
@@ -2022,16 +2183,10 @@ function renderTransactions(content) {
       }
       tableBox.innerHTML =
         '<div class="panel"><div class="table-wrap"><table class="table">' +
-        '<thead><tr><th>Receipt</th><th>Date</th><th>Cashier</th><th class="num-cell">Total</th><th>Status</th><th>Payments</th><th></th></tr></thead>' +
+        '<thead><tr><th>Receipt</th><th>Date</th><th>Cashier</th><th>Customer</th><th class="num-cell">Items</th><th class="num-cell">Total</th><th>Status</th><th></th></tr></thead>' +
         "<tbody>" +
         items
           .map(function (t) {
-            var methods = (t.payments || [])
-              .map(function (p) {
-                return p.method;
-              })
-              .filter(Boolean)
-              .join(", ");
             return (
               '<tr class="clickable" data-id="' +
               esc(t.id) +
@@ -2045,14 +2200,17 @@ function renderTransactions(content) {
               "<td>" +
               esc(t.cashier_name || "—") +
               "</td>" +
+              "<td>" +
+              esc(t.customer_name || "—") +
+              "</td>" +
+              '<td class="num-cell">' +
+              num(t.item_count) +
+              "</td>" +
               '<td class="num-cell">' +
               fmtMoney(t.grand_total) +
               "</td>" +
               "<td>" +
               stBadge(t.status) +
-              "</td>" +
-              '<td class="muted-cell">' +
-              esc(methods || "—") +
               "</td>" +
               '<td class="cell-actions"><span class="badge st-info">View</span></td>' +
               "</tr>"
@@ -2237,11 +2395,6 @@ async function openTransactionDetail(id, onChanged) {
         .join("")
     : '<tr><td colspan="3" class="muted-cell">No payment records.</td></tr>';
 
-  if (t.note)
-    m.body.appendChild(
-      h("p", { class: "hint", style: "margin-top:10px" }, "Note: " + t.note),
-    );
-
   m.foot.innerHTML = "";
   m.foot.appendChild(
     h("button", { class: "btn ghost", onClick: m.close }, "Close"),
@@ -2395,7 +2548,7 @@ function renderProducts(content) {
             store_id: storeSel.value || undefined,
             low_stock: lowStock.checked ? "true" : undefined,
             active: inclInactive.checked ? undefined : "true",
-            per_page: 200,
+            per_page: 100,
           }),
       );
       var items = itemsOf(data);
@@ -2519,8 +2672,10 @@ function openProductModal(existing, onSaved) {
     value: existing ? existing.barcode || "" : "",
   });
   var barcodeType = h("select", { class: "select" });
-  ["", "UPC-A", "EAN-13", "EAN-8"].forEach(function (v) {
-    barcodeType.appendChild(h("option", { value: v }, v === "" ? "None" : v));
+  ["", "UPC-A", "EAN-13", "EAN-8", "CODE39"].forEach(function (v) {
+    barcodeType.appendChild(
+      h("option", { value: v }, v === "" ? "Auto-detect" : v),
+    );
   });
   if (existing && existing.barcode_type)
     barcodeType.value = String(existing.barcode_type);
@@ -2540,7 +2695,7 @@ function openProductModal(existing, onSaved) {
     value: existing ? String(num(existing.selling_price)) : "",
   });
   var unit = h("select", { class: "select" });
-  ["PIECE", "KG", "L", "BOX"].forEach(function (u) {
+  ["PIECE", "KG", "L", "BOX", "PACK"].forEach(function (u) {
     unit.appendChild(h("option", { value: u }, u));
   });
   if (existing && existing.unit) unit.value = String(existing.unit);
@@ -2625,6 +2780,8 @@ function openProductModal(existing, onSaved) {
       ),
     );
   }
+
+  m.body.appendChild(form);
 
   m.foot.innerHTML = "";
   var cancel = h("button", { class: "btn ghost" }, "Cancel");
@@ -2914,7 +3071,7 @@ function renderInventory(content) {
           qs({
             store_id: storeSel.value || undefined,
             low_stock: lowStock.checked ? "true" : undefined,
-            per_page: 200,
+            per_page: 100,
           }),
       );
       var items = itemsOf(data);
@@ -3240,22 +3397,26 @@ function openTransferDialog(onDone) {
 
 async function openMovementsLog(storeId) {
   var m = openModal({
-    title: "Stock movements (latest 50)",
+    title: "Stock movements (latest 100)",
     wide: true,
     footer: true,
   });
   m.body.innerHTML = '<div class="loading">Loading movements…</div>';
   var movements = [];
-  var prodMap = {};
-  var results = await Promise.allSettled([
-    apiFetch("/inventory/movements" + qs({ store_id: storeId || undefined })),
-    apiFetch("/products" + qs({ per_page: 500 })),
-  ]);
-  if (results[0].status === "fulfilled") movements = itemsOf(results[0].value);
-  if (results[1].status === "fulfilled") {
-    itemsOf(results[1].value).forEach(function (p) {
-      prodMap[p.id] = p.name;
-    });
+  try {
+    movements = itemsOf(
+      await apiFetch(
+        "/inventory/movements" +
+          qs({ store_id: storeId || undefined, per_page: 100 }),
+      ),
+    );
+  } catch (err) {
+    m.body.innerHTML = "";
+    m.body.appendChild(errorBox(err));
+    m.foot.appendChild(
+      h("button", { class: "btn ghost", onClick: m.close }, "Close"),
+    );
+    return;
   }
 
   m.body.innerHTML = "";
@@ -3267,7 +3428,6 @@ async function openMovementsLog(storeId) {
       '<thead><tr><th>When</th><th>Product</th><th>Type</th><th class="num-cell">Delta</th><th class="num-cell">Unit cost</th><th>Reason</th><th>By</th></tr></thead>' +
       "<tbody>" +
       movements
-        .slice(0, 50)
         .map(function (mv) {
           return (
             "<tr>" +
@@ -3275,7 +3435,7 @@ async function openMovementsLog(storeId) {
             esc(fmtDateTime(mv.created_at)) +
             "</td>" +
             "<td>" +
-            esc(prodMap[mv.product_id] || "#" + mv.product_id) +
+            esc(mv.product_name || mv.sku || "#" + mv.product_id) +
             "</td>" +
             "<td>" +
             stBadge(mv.adjustment_type) +
@@ -3344,13 +3504,15 @@ function renderPurchases(content, opts) {
     storeSel.value = String(state.storeId);
 
   var isSupplier = role() === "SUPPLIER";
+  /* Backend gates: create/submit/cancel/receive = ADMIN|MANAGER|INVENTORY_MANAGER */
+  var canManage = !isSupplier;
   if (isSupplier && state.user && state.user.supplier_id != null) {
     supplierSel.value = String(state.user.supplier_id);
     supplierSel.disabled = true;
   }
 
   var newBtn = h("button", { class: "btn primary" }, "+ New purchase order");
-  if (deliveriesMode) newBtn.hidden = true;
+  if (deliveriesMode || isSupplier) newBtn.hidden = true;
   var tableBox = h("div", {});
 
   content.appendChild(
@@ -3510,12 +3672,12 @@ async function openPoDetail(id, onChanged) {
       return;
     }
     var st = String(po.status || "").toUpperCase();
-    var canReceive =
-      st === "APPROVED" ||
-      (st === "RECEIVED" &&
-        (po.items || []).some(function (it) {
-          return num(it.quantity_ordered) - num(it.quantity_received) > 0;
-        }));
+    var manage =
+      ["ADMIN", "MANAGER", "INVENTORY_MANAGER"].indexOf(role()) !== -1;
+    var staff = role() === "ADMIN" || role() === "MANAGER";
+    /* The backend only accepts deliveries while the order is APPROVED —
+       a fully RECEIVED order (or DRAFT/SUBMITTED) cannot receive stock. */
+    var canReceive = st === "APPROVED" && manage;
 
     m.body.innerHTML = "";
     m.body.appendChild(
@@ -3663,11 +3825,11 @@ async function openPoDetail(id, onChanged) {
       return btn;
     }
 
-    if (st === "DRAFT")
+    if (st === "DRAFT" && manage)
       m.foot.appendChild(action("Submit", "primary", "submit"));
-    if (st === "SUBMITTED" && isStaff())
+    if (st === "SUBMITTED" && staff)
       m.foot.appendChild(action("Approve", "success", "approve"));
-    if (st === "DRAFT" || st === "SUBMITTED")
+    if ((st === "DRAFT" || st === "SUBMITTED") && manage)
       m.foot.appendChild(action("Cancel", "danger", "cancel"));
     if (canReceive) {
       var rx = h("button", { class: "btn primary" }, "📦 Receive delivery");
@@ -4220,7 +4382,7 @@ function renderCustomers(content) {
       }
       tableBox.innerHTML =
         '<div class="panel"><div class="table-wrap"><table class="table">' +
-        '<thead><tr><th>Name</th><th>Phone</th><th>Email</th><th class="num-cell">Loyalty points</th><th></th></tr></thead>' +
+        '<thead><tr><th>Name</th><th>Phone</th><th>Email</th><th class="num-cell">Loyalty points</th><th class="num-cell">Total spent</th><th></th></tr></thead>' +
         "<tbody>" +
         items
           .map(function (c) {
@@ -4239,6 +4401,9 @@ function renderCustomers(content) {
               "</td>" +
               '<td class="num-cell">' +
               num(c.loyalty_points != null ? c.loyalty_points : c.points) +
+              "</td>" +
+              '<td class="num-cell">' +
+              fmtMoney(c.total_spent) +
               "</td>" +
               '<td class="cell-actions"><button class="btn ghost small" data-act="edit">Edit</button></td>' +
               "</tr>"
@@ -4476,7 +4641,10 @@ function renderReports(content) {
 
     var results = await Promise.allSettled([
       apiFetch("/reports/daily-sales" + qs({ from: f, to: t, store_id: sid })),
-      apiFetch("/reports/top-products" + qs({ from: f, to: t, limit: 10 })),
+      apiFetch(
+        "/reports/top-products" +
+          qs({ from: f, to: t, store_id: sid, limit: 10 }),
+      ),
       apiFetch("/reports/profit" + qs({ from: f, to: t, store_id: sid })),
       apiFetch("/reports/employee-performance" + qs({ from: f, to: t })),
       apiFetch("/reports/low-stock" + qs({ store_id: sidLow })),
@@ -4643,6 +4811,11 @@ function renderReports(content) {
           "<tbody>" +
           emps
             .map(function (e) {
+              /* The API returns revenue + tx count; average ticket is derived. */
+              var avg =
+                num(e.transactions) > 0
+                  ? round2(num(e.revenue) / num(e.transactions))
+                  : 0;
               return (
                 "<tr><td>" +
                 esc(e.name) +
@@ -4654,7 +4827,7 @@ function renderReports(content) {
                 fmtMoney(e.revenue) +
                 "</td>" +
                 '<td class="num-cell">' +
-                fmtMoney(e.avg_ticket) +
+                fmtMoney(avg) +
                 "</td></tr>"
               );
             })
@@ -4723,7 +4896,8 @@ function renderReports(content) {
               fmtMoney(p.cost_price) +
               "</td>" +
               '<td class="num-cell">' +
-              fmtMoney(p.value) +
+              /* the API sends quantity + cost only — value is derived */
+              fmtMoney(round2(num(p.quantity) * num(p.cost_price))) +
               "</td></tr>"
             );
           })
@@ -4791,6 +4965,9 @@ function renderUsers(content) {
         "<tbody>" +
         items
           .map(function (u) {
+            var isAdminTarget = String(u.role).toUpperCase() === "ADMIN";
+            var canEdit =
+              role() === "ADMIN" || (role() === "MANAGER" && !isAdminTarget);
             return (
               '<tr data-id="' +
               esc(u.id) +
@@ -4813,22 +4990,53 @@ function renderUsers(content) {
               '<td class="muted-cell">' +
               esc(u.store_id != null ? storeName(u.store_id) : "—") +
               "</td>" +
-              '<td class="cell-actions"><button class="btn ghost small" data-act="edit">Edit</button></td>' +
+              '<td class="cell-actions">' +
+              (canEdit
+                ? '<button class="btn ghost small" data-act="edit">Edit</button>'
+                : "") +
+              (role() === "ADMIN" && u.id !== state.user.id
+                ? '<button class="btn danger small" data-act="del">Suspend</button>'
+                : "") +
+              "</td>" +
               "</tr>"
             );
           })
           .join("") +
         "</tbody></table></div></div>";
 
-      tableBox.querySelector("tbody").addEventListener("click", function (ev) {
-        var btn = ev.target.closest("button[data-act]");
-        if (!btn) return;
-        var row = btn.closest("tr[data-id]");
-        var u = items.find(function (x) {
-          return String(x.id) === row.dataset.id;
+      tableBox
+        .querySelector("tbody")
+        .addEventListener("click", async function (ev) {
+          var btn = ev.target.closest("button[data-act]");
+          if (!btn) return;
+          var row = btn.closest("tr[data-id]");
+          var u = items.find(function (x) {
+            return String(x.id) === row.dataset.id;
+          });
+          if (!u) return;
+          if (btn.dataset.act === "edit") {
+            openUserEditModal(u, load);
+            return;
+          }
+          /* DELETE /users/{id} is a soft delete — the account is suspended. */
+          var ok = await confirmDialog({
+            title: "Suspend user",
+            message:
+              'Suspend "' +
+              u.name +
+              '"? They will no longer be able to sign in.',
+            danger: true,
+            okLabel: "Suspend",
+          });
+          if (!ok) return;
+          try {
+            await apiFetch("/users/" + u.id, { method: "DELETE" });
+            toast("success", "User suspended.");
+            load();
+          } catch (err) {
+            toastError(err);
+          }
         });
-        if (u) openUserEditModal(u, load);
-      });
     } catch (err) {
       tableBox.innerHTML = "";
       tableBox.appendChild(h("div", { class: "panel" }, errorBox(err)));
