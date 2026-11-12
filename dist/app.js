@@ -781,27 +781,8 @@ function showLogin(notice) {
   var pane = h("div", {});
   card.appendChild(pane);
 
-  card.appendChild(
-    h(
-      "div",
-      { class: "login-api" },
-      h("label", { class: "label" }, "API server"),
-      h("input", {
-        class: "input",
-        value: state.apiBase,
-        placeholder: "http://127.0.0.1:8080",
-      }),
-    ),
-  );
-  var apiInput = card.querySelector(".login-api .input");
-  apiInput.addEventListener("change", function () {
-    var v = apiInput.value.trim().replace(/\/+$/, "");
-    if (v && v !== state.apiBase) {
-      state.apiBase = v;
-      saveApiBase(v);
-      toast("info", "API server updated: " + v);
-    }
-  });
+  /* The API server is configured via the desktop app's .env (API_BASE_URL),
+     read at startup through Tauri get_config — nothing shown on screen. */
 
   function setMode(pinMode) {
     tabPass.classList.toggle("active", !pinMode);
@@ -1025,10 +1006,17 @@ async function startApp() {
     state.user && state.user.store_id != null
       ? String(state.user.store_id)
       : null;
+  /* Without a home store, default to the first physical (non-online)
+     storefront — the online WEB store has no stock to sell from. */
+  var physical = state.stores.filter(function (s) {
+    return s.is_online !== true;
+  })[0];
   state.storeId =
     own != null && own !== ""
       ? own
-      : (state.stores[0] && state.stores[0].id) || null;
+      : physical
+        ? String(physical.id)
+        : (state.stores[0] && state.stores[0].id) || null;
   syncHeaderStore();
   startNotifPolling();
   navigate(defaultSection());
@@ -1060,6 +1048,8 @@ function renderShell() {
       });
     }
   });
+  /* Suppliers are portal users — they don't operate a storefront. */
+  if (role() === "SUPPLIER") storeSel.hidden = true;
 
   var bellBtn = h(
     "button",
@@ -1071,6 +1061,8 @@ function renderShell() {
     "🔔",
     h("span", { id: "bell-badge", class: "bell-badge", hidden: true }, ""),
   );
+  /* /notifications is staff-only — suppliers get neither the bell nor polling. */
+  if (role() === "SUPPLIER") bellBtn.hidden = true;
   bellBtn.addEventListener("click", function () {
     navigate("notifications");
   });
@@ -2564,6 +2556,9 @@ function renderProducts(content) {
         items
           .map(function (p) {
             var stock = p.stock == null ? "—" : fmtQty(p.stock);
+            /* Backend DELETE /products/{id} is ADMIN|MANAGER only —
+               INVENTORY_MANAGER sees no Deactivate action. */
+            var canDeactivate = role() === "ADMIN" || role() === "MANAGER";
             return (
               '<tr data-id="' +
               esc(p.id) +
@@ -2599,9 +2594,9 @@ function renderProducts(content) {
               "</td>" +
               '<td class="cell-actions">' +
               '<button class="btn ghost small" data-act="edit">Edit</button>' +
-              (p.is_active === false
-                ? ""
-                : '<button class="btn danger small" data-act="del">Deactivate</button>') +
+              (canDeactivate && p.is_active !== false
+                ? '<button class="btn danger small" data-act="del">Deactivate</button>'
+                : "") +
               "</td>" +
               "</tr>"
             );
@@ -5058,7 +5053,10 @@ function openUserCreateModal(onSaved) {
     placeholder: "4–8 digits (optional)",
   });
   var roleSel = h("select", { class: "select" });
-  ROLES.forEach(function (r) {
+  /* Backend POST /auth/register: only admins can create ADMIN or SUPPLIER. */
+  ROLES.filter(function (r) {
+    return role() === "ADMIN" || (r !== "ADMIN" && r !== "SUPPLIER");
+  }).forEach(function (r) {
     roleSel.appendChild(h("option", { value: r }, r.replace("_", " ")));
   });
   var storeSel = h("select", { class: "select" });
@@ -5187,7 +5185,13 @@ function openUserEditModal(u, onSaved) {
   var name = h("input", { class: "input", value: u.name || "" });
   var phone = h("input", { class: "input", value: u.phone || "" });
   var roleSel = h("select", { class: "select" });
-  ROLES.forEach(function (r) {
+  /* Only admins may (re)assign ADMIN or SUPPLIER; the target's current role
+     always stays selectable so the modal shows a truthful value. */
+  ROLES.filter(function (r) {
+    return (
+      r === u.role || role() === "ADMIN" || (r !== "ADMIN" && r !== "SUPPLIER")
+    );
+  }).forEach(function (r) {
     var opt = h("option", { value: r }, r.replace("_", " "));
     roleSel.appendChild(opt);
   });
@@ -5346,6 +5350,8 @@ async function refreshBellCount() {
 
 function startNotifPolling() {
   stopNotifPolling();
+  /* Suppliers have no notification feed (backend gates it to staff). */
+  if (role() === "SUPPLIER") return;
   refreshBellCount();
   state.notifTimer = setInterval(refreshBellCount, 30000);
 }

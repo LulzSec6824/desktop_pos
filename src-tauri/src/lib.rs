@@ -28,11 +28,27 @@ fn get_config() -> ApiConfig {
     }
 }
 
+fn load_env_files() {
+    // Try CWD-relative locations first (cargo run / tauri dev).
+    let _ = dotenvy::from_path("src-tauri/.env");
+    let _ = dotenvy::from_path("../../.env");
+    // Then exe-relative ones, so double-clicking the exe (or a bundled
+    // install) still finds the config. dotenvy never overwrites variables
+    // that are already set, so extra attempts are harmless.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = exe_dir {
+        let _ = dotenvy::from_path(dir.join(".env")); // installed bundle
+        let _ = dotenvy::from_path(dir.join("../../.env")); // src-tauri/.env
+        let _ = dotenvy::from_path(dir.join("../../../.env")); // desktop_pos/.env
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Load .env files silently — a missing file is perfectly normal.
-    let _ = dotenvy::from_path("src-tauri/.env");
-    let _ = dotenvy::from_path("../../.env");
+    load_env_files();
 
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![get_config])
